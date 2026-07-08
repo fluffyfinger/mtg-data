@@ -8,6 +8,12 @@ within the CSV have their quantities summed. Rows whose printing isn't in
 With --prune, collection rows whose key is absent from the CSV are deleted
 afterwards, making the table an exact mirror of the export.
 
+Talks to Supabase over HTTPS (the REST/PostgREST API via supabase-py)
+rather than a raw Postgres connection, so this runs the same from a desktop
+`.env` session or a remote/mobile Claude Code session where only outbound
+HTTPS is allowed — unlike sync_scryfall.py, which needs a direct DB
+connection and is desktop-only.
+
 Usage:
     python scripts/sync_manabox.py path/to/ManaBox_Collection.csv
     python scripts/sync_manabox.py path/to/export.csv --prune
@@ -18,7 +24,7 @@ import csv
 import sys
 from pathlib import Path
 
-import psycopg
+from supabase import create_client
 
 import config
 
@@ -27,8 +33,10 @@ COLUMNS = (
     "quantity", "condition", "language", "binder_name", "binder_type",
     "purchase_price",
 )
-UPSERT_SET = ", ".join(f"{c} = excluded.{c}" for c in COLUMNS[1:]) + ", last_synced = now()"
 BATCH_SIZE = 500
+# PostgREST builds `in_()` filters as a query string, so keep chunks well
+# under any URL-length limit.
+FETCH_CHUNK_SIZE = 200
 
 # ManaBox foil column values: "normal", "foil", "etched". The collection
 # table only tracks a boolean, so any special treatment counts as foil.
@@ -70,45 +78,71 @@ def parse_csv(path: Path) -> list[dict]:
     return list(entries.values())
 
 
-def upsert_batch(cur, batch: list[dict]) -> tuple[int, int]:
-    """Upsert one batch; return (inserted, updated) counts via the xmax trick."""
-    placeholders = "(" + ", ".join(["%s"] * len(COLUMNS)) + ")"
-    stmt = (
-        f"insert into collection ({', '.join(COLUMNS)}) values "
-        + ", ".join([placeholders] * len(batch))
-        + " on conflict (scryfall_id, foil, binder_name) do update set "
-        + UPSERT_SET
-        + " returning (xmax = 0)"
-    )
-    cur.execute(stmt, [e[c] for e in batch for c in COLUMNS])
-    inserted = sum(1 for (is_insert,) in cur.fetchall() if is_insert)
-    return inserted, len(batch) - inserted
+def chunks(items: list, size: int):
+    for start in range(0, len(items), size):
+        yield items[start:start + size]
 
 
-def prune(cur, entries: list[dict]) -> list[tuple]:
+def fetch_known_scryfall_ids(client, scryfall_ids: list[str]) -> set[str]:
+    """Return the subset of scryfall_ids present in `cards`."""
+    known: set[str] = set()
+    for chunk in chunks(sorted(set(scryfall_ids)), FETCH_CHUNK_SIZE):
+        resp = client.table("cards").select("scryfall_id").in_("scryfall_id", chunk).execute()
+        known.update(row["scryfall_id"] for row in resp.data)
+    return known
+
+
+def fetch_existing_collection(client) -> dict[tuple, dict]:
+    """Return {(scryfall_id, foil, binder_name): row} for every current row,
+    where row has "id", "name", "set_code" for prune reporting.
+    """
+    existing: dict[tuple, dict] = {}
+    page_size = 1000
+    offset = 0
+    while True:
+        resp = (
+            client.table("collection")
+            .select("id, scryfall_id, foil, binder_name, name, set_code")
+            .range(offset, offset + page_size - 1)
+            .execute()
+        )
+        for row in resp.data:
+            existing[(row["scryfall_id"], row["foil"], row["binder_name"])] = row
+        if len(resp.data) < page_size:
+            break
+        offset += page_size
+    return existing
+
+
+def upsert_entries(client, entries: list[dict], existing: dict[tuple, dict]) -> tuple[int, int]:
+    """Upsert all entries; return (inserted, updated) counts."""
+    inserted = updated = 0
+    for entry in entries:
+        key = (entry["scryfall_id"], entry["foil"], entry["binder_name"])
+        if key in existing:
+            updated += 1
+        else:
+            inserted += 1
+    for batch in chunks(entries, BATCH_SIZE):
+        rows = [{c: e[c] for c in COLUMNS} for e in batch]
+        client.table("collection").upsert(
+            rows, on_conflict="scryfall_id,foil,binder_name"
+        ).execute()
+    return inserted, updated
+
+
+def prune(client, entries: list[dict], existing: dict[tuple, dict]) -> list[dict]:
     """Delete collection rows whose (scryfall_id, foil, binder_name) key is
     not in the CSV. Returns the deleted rows for reporting.
-
-    NOT EXISTS rather than NOT IN so rows with a NULL scryfall_id (never
-    produced by this script, but allowed by the schema) still get pruned.
     """
-    cur.execute(
-        """
-        delete from collection c
-        where not exists (
-          select 1
-          from unnest(%s::uuid[], %s::boolean[], %s::text[]) as k(sid, foil, binder)
-          where c.scryfall_id = k.sid and c.foil = k.foil and c.binder_name = k.binder
-        )
-        returning name, set_code, binder_name
-        """,
-        (
-            [e["scryfall_id"] for e in entries],
-            [e["foil"] for e in entries],
-            [e["binder_name"] for e in entries],
-        ),
-    )
-    return cur.fetchall()
+    keep_keys = {(e["scryfall_id"], e["foil"], e["binder_name"]) for e in entries}
+    to_delete = [row for key, row in existing.items() if key not in keep_keys]
+    if not to_delete:
+        return []
+    ids = [row["id"] for row in to_delete]
+    for id_chunk in chunks(ids, FETCH_CHUNK_SIZE):
+        client.table("collection").delete().in_("id", id_chunk).execute()
+    return to_delete
 
 
 def main() -> int:
@@ -133,45 +167,38 @@ def main() -> int:
         print("dry run — no database changes made")
         return 0
 
-    db_url = config.require("SUPABASE_DB_URL")
-    inserted = updated = 0
-    with psycopg.connect(db_url) as conn, conn.cursor() as cur:
-        # The FK to cards(scryfall_id) makes unknown printings fail the whole
-        # batch, so check first and skip them with a useful message instead.
-        cur.execute(
-            "select scryfall_id::text from cards where scryfall_id = any(%s::uuid[])",
-            ([e["scryfall_id"] for e in entries],),
-        )
-        known = {row[0] for row in cur.fetchall()}
-        # Prune keeps everything in the CSV — including entries skipped below
-        # for a missing cards row — so only cards removed in ManaBox go away.
-        keep = entries
-        missing = [e for e in entries if e["scryfall_id"] not in known]
-        entries = [e for e in entries if e["scryfall_id"] in known]
+    client = create_client(
+        config.require("SUPABASE_URL"), config.require("SUPABASE_SERVICE_ROLE_KEY")
+    )
 
-        if missing:
-            print(f"warning: {len(missing)} entries not found in cards table "
-                  "— run sync_scryfall.py first. Skipped:")
-            for e in missing[:10]:
-                print(f"  {e['name']} ({e['set_code']} #{e['collector_number']})")
-            if len(missing) > 10:
-                print(f"  ... and {len(missing) - 10} more")
-        if not entries:
-            print("error: nothing to sync — cards table has none of these printings")
-            return 1
+    # The FK to cards(scryfall_id) makes unknown printings fail the whole
+    # batch, so check first and skip them with a useful message instead.
+    known = fetch_known_scryfall_ids(client, [e["scryfall_id"] for e in entries])
+    # Prune keeps everything in the CSV — including entries skipped below
+    # for a missing cards row — so only cards removed in ManaBox go away.
+    keep = entries
+    missing = [e for e in entries if e["scryfall_id"] not in known]
+    entries = [e for e in entries if e["scryfall_id"] in known]
 
-        for start in range(0, len(entries), BATCH_SIZE):
-            i, u = upsert_batch(cur, entries[start:start + BATCH_SIZE])
-            inserted += i
-            updated += u
+    if missing:
+        print(f"warning: {len(missing)} entries not found in cards table "
+              "— run sync_scryfall.py first. Skipped:")
+        for e in missing[:10]:
+            print(f"  {e['name']} ({e['set_code']} #{e['collector_number']})")
+        if len(missing) > 10:
+            print(f"  ... and {len(missing) - 10} more")
+    if not entries:
+        print("error: nothing to sync — cards table has none of these printings")
+        return 1
 
-        pruned = prune(cur, keep) if args.prune else []
-        conn.commit()
+    existing = fetch_existing_collection(client)
+    inserted, updated = upsert_entries(client, entries, existing)
+    pruned = prune(client, keep, existing) if args.prune else []
 
     if pruned:
         print(f"pruned {len(pruned)} rows no longer in the export:")
-        for name, set_code, binder in pruned[:10]:
-            print(f"  {name} ({set_code}) from {binder}")
+        for row in pruned[:10]:
+            print(f"  {row['name']} ({row['set_code']}) from {row['binder_name']}")
         if len(pruned) > 10:
             print(f"  ... and {len(pruned) - 10} more")
 

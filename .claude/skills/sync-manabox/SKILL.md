@@ -11,12 +11,14 @@ Run this after Matty exports a new collection CSV from the ManaBox app.
    Otherwise ask him to export from ManaBox (Collection → Export → CSV) and
    attach it or give a path.
 
-2. **Check for credentials.** The script needs `SUPABASE_URL`,
-   `SUPABASE_SERVICE_ROLE_KEY`, `SUPABASE_DB_URL` in the environment — either
-   from a local `.env` (desktop) or environment secrets (mobile/remote). If
-   `python scripts/sync_manabox.py` fails with a missing-env error, tell Matty
-   to check his Claude Code environment secrets rather than trying to create
-   a `.env` in a remote session.
+2. **Check for credentials.** The script talks to Supabase over HTTPS (REST
+   API) and needs `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY` in the
+   environment — either from a local `.env` (desktop) or environment secrets
+   (mobile/remote). It does **not** need `SUPABASE_DB_URL` and does not open
+   a raw Postgres connection, so it works fine in HTTPS-only remote sandboxes.
+   If `python scripts/sync_manabox.py` fails with a missing-env error, tell
+   Matty to check his Claude Code environment secrets rather than trying to
+   create a `.env` in a remote session.
 
 3. **Dry-run first if the diff looks big.** If this is the first sync in a
    while, or Matty seems unsure what changed, run with `--dry-run` first and

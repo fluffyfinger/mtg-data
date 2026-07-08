@@ -62,3 +62,16 @@ Both scripts are idempotent upserts — re-run them freely after each ManaBox
 scan session or when Scryfall data goes stale. Without `--prune`, entries
 removed from ManaBox stay in `collection`; with it, they're deleted and the
 sync reports what was pruned.
+
+### Desktop-only vs. works-anywhere
+
+`sync_scryfall.py` uses a direct Postgres connection (`SUPABASE_DB_URL`),
+which needs raw TCP on port 5432. That's fine on a desktop network but is
+blocked in most remote/mobile sandboxes, which only permit outbound HTTPS —
+so **run Scryfall syncs from your desktop.** It's also a large, slow,
+infrequent operation, which fits desktop better anyway.
+
+`sync_manabox.py` talks to Supabase over HTTPS instead (the REST API via
+`supabase-py`, using `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY`), so it
+runs the same from desktop or a remote/mobile Claude Code session — export a
+CSV from ManaBox on your phone and sync straight from there.
