@@ -35,3 +35,30 @@ Usage in code:
 import config
 url = config.require("SUPABASE_URL")   # raises a clear error if unset
 ```
+
+## Syncing
+
+Order matters: `collection` has a foreign key into `cards`, so sync Scryfall
+first.
+
+```bash
+# 1. Full Scryfall "default_cards" bulk data -> cards table
+#    (downloads ~500MB+ to data/, streams it, upserts in batches)
+python scripts/sync_scryfall.py
+
+# 2. ManaBox CSV export -> collection table
+#    --prune deletes rows no longer in the export, keeping the table an
+#    exact mirror of ManaBox (omit it to only add/update)
+python scripts/sync_manabox.py path/to/ManaBox_Collection.csv --prune
+
+# Preview what a ManaBox sync would do without touching the database:
+python scripts/sync_manabox.py path/to/ManaBox_Collection.csv --dry-run
+
+# Re-running sync_scryfall.py later can reuse the downloaded file:
+python scripts/sync_scryfall.py --file data/default-cards.json
+```
+
+Both scripts are idempotent upserts — re-run them freely after each ManaBox
+scan session or when Scryfall data goes stale. Without `--prune`, entries
+removed from ManaBox stay in `collection`; with it, they're deleted and the
+sync reports what was pruned.

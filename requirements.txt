@@ -1,3 +1,5 @@
 python-dotenv>=1.0    # load local .env; no-op in remote sessions
 supabase>=2.0         # Supabase Python client (REST/auth)
 psycopg[binary]>=3.1  # direct Postgres access via SUPABASE_DB_URL
+requests>=2.31        # download Scryfall bulk data
+ijson>=3.2            # stream-parse the large bulk JSON without loading it all
