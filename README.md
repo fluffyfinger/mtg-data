@@ -75,3 +75,14 @@ infrequent operation, which fits desktop better anyway.
 `supabase-py`, using `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY`), so it
 runs the same from desktop or a remote/mobile Claude Code session — export a
 CSV from ManaBox on your phone and sync straight from there.
+
+Some remote sandboxes route outbound HTTPS through a fixed egress allowlist
+that doesn't include `supabase.co`, so even that HTTPS call can get a `403`
+there. If that happens, use `--emit-sql` instead:
+
+```bash
+# Parses the CSV locally (no network call) and prints one SQL statement
+# to run via the Supabase MCP execute_sql tool, which isn't subject to the
+# sandbox's network policy:
+python scripts/sync_manabox.py path/to/export.csv --emit-sql --prune
+```

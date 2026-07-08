@@ -9,15 +9,23 @@ With --prune, collection rows whose key is absent from the CSV are deleted
 afterwards, making the table an exact mirror of the export.
 
 Talks to Supabase over HTTPS (the REST/PostgREST API via supabase-py)
-rather than a raw Postgres connection, so this runs the same from a desktop
-`.env` session or a remote/mobile Claude Code session where only outbound
-HTTPS is allowed — unlike sync_scryfall.py, which needs a direct DB
-connection and is desktop-only.
+rather than a raw Postgres connection. That's enough for a desktop `.env`
+session, but some remote/mobile Claude Code sandboxes run outbound HTTPS
+through a fixed egress allowlist that doesn't include supabase.co, so even
+this HTTPS call can get a 403 there. For that case, use --emit-sql (below)
+instead of a normal run — it does the CSV parsing locally (no network) and
+prints one SQL statement to run via the Supabase MCP connector, which
+isn't subject to the sandbox's network policy.
 
 Usage:
     python scripts/sync_manabox.py path/to/ManaBox_Collection.csv
     python scripts/sync_manabox.py path/to/export.csv --prune
     python scripts/sync_manabox.py path/to/export.csv --dry-run
+
+    # No network call — prints SQL for the Supabase MCP execute_sql tool to run,
+    # for sandboxes where direct calls to supabase.co are proxy-blocked:
+    python scripts/sync_manabox.py path/to/export.csv --emit-sql
+    python scripts/sync_manabox.py path/to/export.csv --emit-sql --prune
 """
 import argparse
 import csv
@@ -27,6 +35,13 @@ from pathlib import Path
 from supabase import create_client
 
 import config
+
+# Card/binder names can contain non-ASCII characters (accents, em dashes,
+# etc.); Windows consoles often default stdout to a non-UTF-8 codepage,
+# which silently mangles or corrupts them — especially bad for --emit-sql,
+# where corrupted output means broken or wrong SQL.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
 
 COLUMNS = (
     "scryfall_id", "name", "set_code", "collector_number", "foil",
@@ -81,6 +96,90 @@ def parse_csv(path: Path) -> list[dict]:
 def chunks(items: list, size: int):
     for start in range(0, len(items), size):
         yield items[start:start + size]
+
+
+def sql_literal(value) -> str:
+    """Render a Python value as a SQL literal for inlining into --emit-sql output."""
+    if value is None:
+        return "NULL"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return repr(value)
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def build_sql(entries: list[dict], prune_flag: bool) -> str:
+    """Build one self-contained SQL statement that upserts `entries` into
+    `collection` (skipping printings missing from `cards`) and, if
+    prune_flag, deletes collection rows whose key isn't in `entries`.
+
+    Everything happens in one `with` statement so it runs as a single
+    round trip and a single implicit transaction — no dependency on the
+    caller supporting multiple statements per call (e.g. the Supabase MCP
+    execute_sql tool takes one `query` string).
+    """
+    values_rows = []
+    for e in entries:
+        vals = ", ".join(sql_literal(e[c]) for c in COLUMNS)
+        values_rows.append(f"({vals})")
+
+    prune_cte = ""
+    prune_select = "0 as pruned, '' as pruned_sample"
+    if prune_flag:
+        prune_cte = """,
+pruned as (
+  delete from collection c
+  where not exists (
+    select 1 from entries e
+    where c.scryfall_id = e.scryfall_id::uuid
+      and c.foil = e.foil::boolean
+      and c.binder_name = e.binder_name
+  )
+  returning name, set_code, binder_name
+)"""
+        prune_select = (
+            "(select count(*) from pruned) as pruned, "
+            "(select coalesce(string_agg(name || ' (' || coalesce(set_code, '') || ') from ' "
+            "|| binder_name, '; '), '') from (select * from pruned limit 10) p) as pruned_sample"
+        )
+
+    return f"""with entries({', '.join(COLUMNS)}) as (
+  values
+    {','.join(values_rows)}
+),
+known as (
+  select e.* from entries e
+  where exists (select 1 from cards c where c.scryfall_id = e.scryfall_id::uuid)
+),
+upserted as (
+  insert into collection ({', '.join(COLUMNS)})
+  select scryfall_id::uuid, name, set_code, collector_number, foil::boolean,
+         quantity::int, condition, language, binder_name, binder_type,
+         purchase_price::numeric
+  from known
+  on conflict (scryfall_id, foil, binder_name) do update set
+    name = excluded.name,
+    set_code = excluded.set_code,
+    collector_number = excluded.collector_number,
+    quantity = excluded.quantity,
+    condition = excluded.condition,
+    language = excluded.language,
+    binder_type = excluded.binder_type,
+    purchase_price = excluded.purchase_price,
+    last_synced = now()
+  returning (xmax = 0) as is_insert
+){prune_cte}
+select
+  (select count(*) from entries) as parsed,
+  (select count(*) from entries) - (select count(*) from known) as skipped,
+  (select coalesce(string_agg(name || ' (' || coalesce(set_code, '') || ' #' || coalesce(collector_number, '') || ')', ', '), '')
+     from (select * from entries e where not exists (select 1 from cards c where c.scryfall_id = e.scryfall_id::uuid) limit 10) m
+  ) as skipped_sample,
+  (select count(*) filter (where is_insert) from upserted) as inserted,
+  (select count(*) filter (where not is_insert) from upserted) as updated,
+  {prune_select};
+"""
 
 
 def fetch_known_scryfall_ids(client, scryfall_ids: list[str]) -> set[str]:
@@ -152,6 +251,10 @@ def main() -> int:
                     help="parse and summarize without touching the database")
     ap.add_argument("--prune", action="store_true",
                     help="delete collection rows not present in the CSV")
+    ap.add_argument("--emit-sql", action="store_true",
+                    help="print SQL for the Supabase MCP execute_sql tool instead "
+                         "of connecting directly (no network call, for sandboxes "
+                         "that proxy-block supabase.co)")
     args = ap.parse_args()
 
     entries = parse_csv(args.csv_path)
@@ -165,6 +268,10 @@ def main() -> int:
             n = sum(e["quantity"] for e in entries if e["binder_name"] == name)
             print(f"  [{btype}] {name}: {n} cards")
         print("dry run — no database changes made")
+        return 0
+
+    if args.emit_sql:
+        print(build_sql(entries, args.prune))
         return 0
 
     client = create_client(
