@@ -5,8 +5,12 @@ table's unique constraint (scryfall_id, foil, binder_name). Duplicate keys
 within the CSV have their quantities summed. Rows whose printing isn't in
 `cards` yet are skipped with a warning — run sync_scryfall.py first.
 
+With --prune, collection rows whose key is absent from the CSV are deleted
+afterwards, making the table an exact mirror of the export.
+
 Usage:
     python scripts/sync_manabox.py path/to/ManaBox_Collection.csv
+    python scripts/sync_manabox.py path/to/export.csv --prune
     python scripts/sync_manabox.py path/to/export.csv --dry-run
 """
 import argparse
@@ -81,11 +85,39 @@ def upsert_batch(cur, batch: list[dict]) -> tuple[int, int]:
     return inserted, len(batch) - inserted
 
 
+def prune(cur, entries: list[dict]) -> list[tuple]:
+    """Delete collection rows whose (scryfall_id, foil, binder_name) key is
+    not in the CSV. Returns the deleted rows for reporting.
+
+    NOT EXISTS rather than NOT IN so rows with a NULL scryfall_id (never
+    produced by this script, but allowed by the schema) still get pruned.
+    """
+    cur.execute(
+        """
+        delete from collection c
+        where not exists (
+          select 1
+          from unnest(%s::uuid[], %s::boolean[], %s::text[]) as k(sid, foil, binder)
+          where c.scryfall_id = k.sid and c.foil = k.foil and c.binder_name = k.binder
+        )
+        returning name, set_code, binder_name
+        """,
+        (
+            [e["scryfall_id"] for e in entries],
+            [e["foil"] for e in entries],
+            [e["binder_name"] for e in entries],
+        ),
+    )
+    return cur.fetchall()
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("csv_path", type=Path, help="ManaBox CSV export")
     ap.add_argument("--dry-run", action="store_true",
                     help="parse and summarize without touching the database")
+    ap.add_argument("--prune", action="store_true",
+                    help="delete collection rows not present in the CSV")
     args = ap.parse_args()
 
     entries = parse_csv(args.csv_path)
@@ -111,6 +143,9 @@ def main() -> int:
             ([e["scryfall_id"] for e in entries],),
         )
         known = {row[0] for row in cur.fetchall()}
+        # Prune keeps everything in the CSV — including entries skipped below
+        # for a missing cards row — so only cards removed in ManaBox go away.
+        keep = entries
         missing = [e for e in entries if e["scryfall_id"] not in known]
         entries = [e for e in entries if e["scryfall_id"] in known]
 
@@ -129,10 +164,19 @@ def main() -> int:
             i, u = upsert_batch(cur, entries[start:start + BATCH_SIZE])
             inserted += i
             updated += u
+
+        pruned = prune(cur, keep) if args.prune else []
         conn.commit()
 
+    if pruned:
+        print(f"pruned {len(pruned)} rows no longer in the export:")
+        for name, set_code, binder in pruned[:10]:
+            print(f"  {name} ({set_code}) from {binder}")
+        if len(pruned) > 10:
+            print(f"  ... and {len(pruned) - 10} more")
+
     print(f"collection: {inserted} inserted, {updated} updated, "
-          f"{len(missing)} skipped")
+          f"{len(missing)} skipped, {len(pruned)} pruned")
     return 0
 
 

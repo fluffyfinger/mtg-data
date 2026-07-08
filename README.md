@@ -47,7 +47,9 @@ first.
 python scripts/sync_scryfall.py
 
 # 2. ManaBox CSV export -> collection table
-python scripts/sync_manabox.py path/to/ManaBox_Collection.csv
+#    --prune deletes rows no longer in the export, keeping the table an
+#    exact mirror of ManaBox (omit it to only add/update)
+python scripts/sync_manabox.py path/to/ManaBox_Collection.csv --prune
 
 # Preview what a ManaBox sync would do without touching the database:
 python scripts/sync_manabox.py path/to/ManaBox_Collection.csv --dry-run
@@ -57,5 +59,6 @@ python scripts/sync_scryfall.py --file data/default-cards.json
 ```
 
 Both scripts are idempotent upserts — re-run them freely after each ManaBox
-scan session or when Scryfall data goes stale. Entries removed from ManaBox
-are *not* deleted from `collection` (no pruning yet).
+scan session or when Scryfall data goes stale. Without `--prune`, entries
+removed from ManaBox stay in `collection`; with it, they're deleted and the
+sync reports what was pruned.
