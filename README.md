@@ -1,40 +1,17 @@
 # mtg-data
 
-Sync infrastructure for Matty's MTG collection (ManaBox) and Scryfall card data into Supabase.
+Sync infrastructure for Matty's MTG collection (ManaBox) and Scryfall card
+data into Supabase. Run from a desktop terminal.
 
-## Credentials
-
-The scripts read three values from the environment (see `.env.example`):
-
-| Key | Purpose |
-| --- | --- |
-| `SUPABASE_URL` | Project URL |
-| `SUPABASE_SERVICE_ROLE_KEY` | Full read/write key — keep secret |
-| `SUPABASE_DB_URL` | Direct Postgres connection string |
-
-`scripts/config.py` loads these the same way everywhere, so the same code runs
-locally and in a remote/mobile session:
-
-**Local dev** — copy the template and fill it in (the `.env` file is gitignored):
+## Setup
 
 ```bash
-cp .env.example .env      # then edit .env with your values
+cp .env.example .env      # then fill in SUPABASE_DB_URL
 pip install -r requirements.txt
 ```
 
-**Remote / Claude Code on the web / mobile** — do *not* use a `.env` file. Add
-the three keys as **environment secrets** in the Claude Code environment
-settings. Every remote session then gets them injected automatically, so syncs
-and card lookups work from your phone without your machine being on. (Supabase
-itself is always-on cloud infrastructure — nothing here depends on a local
-server.)
-
-Usage in code:
-
-```python
-import config
-url = config.require("SUPABASE_URL")   # raises a clear error if unset
-```
+The scripts need one credential, `SUPABASE_DB_URL` — the project's direct
+Postgres connection string (see `.env.example`).
 
 ## Syncing
 
@@ -58,31 +35,20 @@ python scripts/sync_manabox.py path/to/ManaBox_Collection.csv --dry-run
 python scripts/sync_scryfall.py --file data/default-cards.json
 ```
 
-Both scripts are idempotent upserts — re-run them freely after each ManaBox
-scan session or when Scryfall data goes stale. Without `--prune`, entries
-removed from ManaBox stay in `collection`; with it, they're deleted and the
-sync reports what was pruned.
+Both scripts are idempotent — re-run them freely after each ManaBox scan
+session or when Scryfall data goes stale. Without `--prune`, entries removed
+from ManaBox stay in `collection`; with it, they're deleted and the sync
+reports what was pruned.
 
-### Desktop-only vs. works-anywhere
+Run `sync_scryfall.py` rarely (new set releases, stale data); run
+`sync_manabox.py` after every scan session.
 
-`sync_scryfall.py` uses a direct Postgres connection (`SUPABASE_DB_URL`),
-which needs raw TCP on port 5432. That's fine on a desktop network but is
-blocked in most remote/mobile sandboxes, which only permit outbound HTTPS —
-so **run Scryfall syncs from your desktop.** It's also a large, slow,
-infrequent operation, which fits desktop better anyway.
+## Database
 
-`sync_manabox.py` talks to Supabase over HTTPS instead (the REST API via
-`supabase-py`, using `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY`), so it
-runs the same from desktop or a remote/mobile Claude Code session — export a
-CSV from ManaBox on your phone and sync straight from there.
+Schema lives in `migrations/` as numbered SQL files — every schema change is
+a new file, applied to the Supabase project (ref `heiyckeurcfjpnhmsjfo`) via
+the SQL editor or MCP `apply_migration`, never ad-hoc.
 
-Some remote sandboxes route outbound HTTPS through a fixed egress allowlist
-that doesn't include `supabase.co`, so even that HTTPS call can get a `403`
-there. If that happens, use `--emit-sql` instead:
-
-```bash
-# Parses the CSV locally (no network call) and prints one SQL statement
-# to run via the Supabase MCP execute_sql tool, which isn't subject to the
-# sandbox's network policy:
-python scripts/sync_manabox.py path/to/export.csv --emit-sql --prune
-```
+RLS is enabled on all tables with no anon policies: the REST API is locked
+until the multi-user web app (see `PLAN.md`) adds real auth. The sync scripts
+are unaffected — a direct Postgres connection bypasses RLS.

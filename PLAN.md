@@ -27,7 +27,7 @@ well-designed schema.
 
 ---
 
-## P0 — Clean up existing (desktop/terminal only)
+## P0 — Clean up existing (desktop/terminal only) ✅ *(done 2026-07-08; pending a first real desktop run of the rewritten sync)*
 
 Outcome: one obvious way to run each script, from a terminal, with a `.env`.
 Less code, fewer dependencies, no sandbox lore.

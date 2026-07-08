@@ -8,38 +8,27 @@ within the CSV have their quantities summed. Rows whose printing isn't in
 With --prune, collection rows whose key is absent from the CSV are deleted
 afterwards, making the table an exact mirror of the export.
 
-Talks to Supabase over HTTPS (the REST/PostgREST API via supabase-py)
-rather than a raw Postgres connection. That's enough for a desktop `.env`
-session, but some remote/mobile Claude Code sandboxes run outbound HTTPS
-through a fixed egress allowlist that doesn't include supabase.co, so even
-this HTTPS call can get a 403 there. For that case, use --emit-sql (below)
-instead of a normal run — it does the CSV parsing locally (no network) and
-prints one SQL statement to run via the Supabase MCP connector, which
-isn't subject to the sandbox's network policy.
+The whole sync runs as one SQL statement over a direct Postgres connection
+(SUPABASE_DB_URL, same as sync_scryfall.py), so upsert + prune are atomic
+and the reported counts come from the database itself.
 
 Usage:
     python scripts/sync_manabox.py path/to/ManaBox_Collection.csv
     python scripts/sync_manabox.py path/to/export.csv --prune
     python scripts/sync_manabox.py path/to/export.csv --dry-run
-
-    # No network call — prints SQL for the Supabase MCP execute_sql tool to run,
-    # for sandboxes where direct calls to supabase.co are proxy-blocked:
-    python scripts/sync_manabox.py path/to/export.csv --emit-sql
-    python scripts/sync_manabox.py path/to/export.csv --emit-sql --prune
 """
 import argparse
 import csv
 import sys
 from pathlib import Path
 
-from supabase import create_client
+import psycopg
 
 import config
 
 # Card/binder names can contain non-ASCII characters (accents, em dashes,
 # etc.); Windows consoles often default stdout to a non-UTF-8 codepage,
-# which silently mangles or corrupts them — especially bad for --emit-sql,
-# where corrupted output means broken or wrong SQL.
+# which silently mangles them.
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 
@@ -48,10 +37,6 @@ COLUMNS = (
     "quantity", "condition", "language", "binder_name", "binder_type",
     "purchase_price",
 )
-BATCH_SIZE = 500
-# PostgREST builds `in_()` filters as a query string, so keep chunks well
-# under any URL-length limit.
-FETCH_CHUNK_SIZE = 200
 
 # ManaBox foil column values: "normal", "foil", "etched". The collection
 # table only tracks a boolean, so any special treatment counts as foil.
@@ -93,13 +78,8 @@ def parse_csv(path: Path) -> list[dict]:
     return list(entries.values())
 
 
-def chunks(items: list, size: int):
-    for start in range(0, len(items), size):
-        yield items[start:start + size]
-
-
 def sql_literal(value) -> str:
-    """Render a Python value as a SQL literal for inlining into --emit-sql output."""
+    """Render a Python value as a SQL literal for inlining into the statement."""
     if value is None:
         return "NULL"
     if isinstance(value, bool):
@@ -114,10 +94,9 @@ def build_sql(entries: list[dict], prune_flag: bool) -> str:
     `collection` (skipping printings missing from `cards`) and, if
     prune_flag, deletes collection rows whose key isn't in `entries`.
 
-    Everything happens in one `with` statement so it runs as a single
-    round trip and a single implicit transaction — no dependency on the
-    caller supporting multiple statements per call (e.g. the Supabase MCP
-    execute_sql tool takes one `query` string).
+    Everything happens in one `with` statement so upsert + prune run as a
+    single round trip and a single implicit transaction, and the summary
+    counts come straight from the writes themselves.
     """
     values_rows = []
     for e in entries:
@@ -182,68 +161,6 @@ select
 """
 
 
-def fetch_known_scryfall_ids(client, scryfall_ids: list[str]) -> set[str]:
-    """Return the subset of scryfall_ids present in `cards`."""
-    known: set[str] = set()
-    for chunk in chunks(sorted(set(scryfall_ids)), FETCH_CHUNK_SIZE):
-        resp = client.table("cards").select("scryfall_id").in_("scryfall_id", chunk).execute()
-        known.update(row["scryfall_id"] for row in resp.data)
-    return known
-
-
-def fetch_existing_collection(client) -> dict[tuple, dict]:
-    """Return {(scryfall_id, foil, binder_name): row} for every current row,
-    where row has "id", "name", "set_code" for prune reporting.
-    """
-    existing: dict[tuple, dict] = {}
-    page_size = 1000
-    offset = 0
-    while True:
-        resp = (
-            client.table("collection")
-            .select("id, scryfall_id, foil, binder_name, name, set_code")
-            .range(offset, offset + page_size - 1)
-            .execute()
-        )
-        for row in resp.data:
-            existing[(row["scryfall_id"], row["foil"], row["binder_name"])] = row
-        if len(resp.data) < page_size:
-            break
-        offset += page_size
-    return existing
-
-
-def upsert_entries(client, entries: list[dict], existing: dict[tuple, dict]) -> tuple[int, int]:
-    """Upsert all entries; return (inserted, updated) counts."""
-    inserted = updated = 0
-    for entry in entries:
-        key = (entry["scryfall_id"], entry["foil"], entry["binder_name"])
-        if key in existing:
-            updated += 1
-        else:
-            inserted += 1
-    for batch in chunks(entries, BATCH_SIZE):
-        rows = [{c: e[c] for c in COLUMNS} for e in batch]
-        client.table("collection").upsert(
-            rows, on_conflict="scryfall_id,foil,binder_name"
-        ).execute()
-    return inserted, updated
-
-
-def prune(client, entries: list[dict], existing: dict[tuple, dict]) -> list[dict]:
-    """Delete collection rows whose (scryfall_id, foil, binder_name) key is
-    not in the CSV. Returns the deleted rows for reporting.
-    """
-    keep_keys = {(e["scryfall_id"], e["foil"], e["binder_name"]) for e in entries}
-    to_delete = [row for key, row in existing.items() if key not in keep_keys]
-    if not to_delete:
-        return []
-    ids = [row["id"] for row in to_delete]
-    for id_chunk in chunks(ids, FETCH_CHUNK_SIZE):
-        client.table("collection").delete().in_("id", id_chunk).execute()
-    return to_delete
-
-
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("csv_path", type=Path, help="ManaBox CSV export")
@@ -251,10 +168,6 @@ def main() -> int:
                     help="parse and summarize without touching the database")
     ap.add_argument("--prune", action="store_true",
                     help="delete collection rows not present in the CSV")
-    ap.add_argument("--emit-sql", action="store_true",
-                    help="print SQL for the Supabase MCP execute_sql tool instead "
-                         "of connecting directly (no network call, for sandboxes "
-                         "that proxy-block supabase.co)")
     args = ap.parse_args()
 
     entries = parse_csv(args.csv_path)
@@ -263,6 +176,10 @@ def main() -> int:
     print(f"parsed {len(entries)} collection entries ({total_qty} cards) "
           f"across {len(binders)} binders/decks")
 
+    if not entries:
+        print("error: nothing to sync — the CSV has no usable rows")
+        return 1
+
     if args.dry_run:
         for name, btype in binders:
             n = sum(e["quantity"] for e in entries if e["binder_name"] == name)
@@ -270,47 +187,24 @@ def main() -> int:
         print("dry run — no database changes made")
         return 0
 
-    if args.emit_sql:
-        print(build_sql(entries, args.prune))
-        return 0
+    db_url = config.require("SUPABASE_DB_URL")
+    with psycopg.connect(db_url) as conn, conn.cursor() as cur:
+        cur.execute(build_sql(entries, args.prune))
+        row = cur.fetchone()
+        cols = [d.name for d in cur.description]
+        summary = dict(zip(cols, row))
+        conn.commit()
 
-    client = create_client(
-        config.require("SUPABASE_URL"), config.require("SUPABASE_SERVICE_ROLE_KEY")
-    )
-
-    # The FK to cards(scryfall_id) makes unknown printings fail the whole
-    # batch, so check first and skip them with a useful message instead.
-    known = fetch_known_scryfall_ids(client, [e["scryfall_id"] for e in entries])
-    # Prune keeps everything in the CSV — including entries skipped below
-    # for a missing cards row — so only cards removed in ManaBox go away.
-    keep = entries
-    missing = [e for e in entries if e["scryfall_id"] not in known]
-    entries = [e for e in entries if e["scryfall_id"] in known]
-
-    if missing:
-        print(f"warning: {len(missing)} entries not found in cards table "
+    if summary["skipped"]:
+        print(f"warning: {summary['skipped']} entries not found in cards table "
               "— run sync_scryfall.py first. Skipped:")
-        for e in missing[:10]:
-            print(f"  {e['name']} ({e['set_code']} #{e['collector_number']})")
-        if len(missing) > 10:
-            print(f"  ... and {len(missing) - 10} more")
-    if not entries:
-        print("error: nothing to sync — cards table has none of these printings")
-        return 1
+        print(f"  {summary['skipped_sample']}")
+    if summary["pruned"]:
+        print(f"pruned {summary['pruned']} rows no longer in the export:")
+        print(f"  {summary['pruned_sample']}")
 
-    existing = fetch_existing_collection(client)
-    inserted, updated = upsert_entries(client, entries, existing)
-    pruned = prune(client, keep, existing) if args.prune else []
-
-    if pruned:
-        print(f"pruned {len(pruned)} rows no longer in the export:")
-        for row in pruned[:10]:
-            print(f"  {row['name']} ({row['set_code']}) from {row['binder_name']}")
-        if len(pruned) > 10:
-            print(f"  ... and {len(pruned) - 10} more")
-
-    print(f"collection: {inserted} inserted, {updated} updated, "
-          f"{len(missing)} skipped, {len(pruned)} pruned")
+    print(f"collection: {summary['inserted']} inserted, {summary['updated']} updated, "
+          f"{summary['skipped']} skipped, {summary['pruned']} pruned")
     return 0
 
 
