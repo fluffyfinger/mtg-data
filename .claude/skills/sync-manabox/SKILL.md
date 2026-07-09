@@ -40,7 +40,7 @@ Run this after Matty exports a new collection CSV from the ManaBox app.
    This does the CSV parsing locally (no network call) and prints one
    self-contained SQL statement to stdout. Take that SQL verbatim and run it
    with the Supabase `execute_sql` MCP tool (project ref
-   `heiyckeurcfjpnhmsjfo`), which goes through the approved MCP connector
+   `oxpgmwiwwmehaireeqnb`), which goes through the approved MCP connector
    instead of the sandbox's blocked network egress. The query returns one
    summary row: `parsed`, `skipped`, `skipped_sample`, `inserted`, `updated`,
    `pruned`, `pruned_sample` — use it the same way as the normal run's

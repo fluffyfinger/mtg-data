@@ -1,6 +1,10 @@
 -- Initial schema for the MTG collection sync project.
--- Already applied to Supabase project ref heiyckeurcfjpnhmsjfo;
--- this file exists for version control only.
+--
+-- HISTORICAL: originally applied to Supabase project heiyckeurcfjpnhmsjfo
+-- (retired). As of 2026-07-08 this schema lives in the shared tracker
+-- project (oxpgmwiwwmehaireeqnb) instead -- see mtg-tracker's
+-- supabase/migrations/20260708213202_collection_sync_schema.sql for the
+-- version of record. Kept here for history only; do not reapply.
 
 create table cards (
   scryfall_id uuid primary key,

@@ -28,8 +28,9 @@ Use the official Wizards Commander Brackets system when rating deck power: https
 ## Tools & Resources
 Scryfall (card lookup), EDHREC (Commander suggestions), Obsidian (notes vault), Google Calendar (event reminders), Eventbrite (tickets), tiiny.host / Netlify Drop (hosting HTML artifacts).
 
-**Supabase project:** MTG Collection (ref: `heiyckeurcfjpnhmsjfo`)
+**Supabase project:** shared with the Dad Pod Tracker app (ref: `oxpgmwiwwmehaireeqnb`) — one Postgres database backs both this sync repo and the mtg-tracker Vercel app, so a ManaBox sync here shows up in the app immediately.
 - `cards` — full Scryfall data (oracle text, mana cost, type line, P/T, color identity, keywords, rarity, legalities), one row per printing
 - `collection` — ManaBox export synced in, matched to `cards` via `scryfall_id`
 - `collection_enriched` — view joining the two for one-shot queries
 - Sync scripts live in `scripts/` (`sync_scryfall.py`, `sync_manabox.py`) — re-run after each ManaBox scan session
+- `players`, `cmd_games`, `hg_sessions`, `draft_nights`, `pod_nights`, `session_polls`, `poll_votes`, `tournament_nights` — the tracker app's own tables, owned by the mtg-tracker repo (schema in its `supabase/migrations/`)
