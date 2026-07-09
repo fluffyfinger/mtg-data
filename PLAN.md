@@ -96,11 +96,15 @@ chunks: the app keeps working against existing tables throughout.
 - **Verify:** log a real game with a picked deck; colors render on
   dashboard/history.
 
-**Chunk 5 — Retire the old project**
-*~10 min, after a comfortable verification window (suggest 2+ weeks)*
-
-- Confirm no script/doc/secret still points at `heiyckeurcfjpnhmsjfo`.
-- Pause, then delete the old Supabase project.
+**Chunk 5 — Retire the old project** — done 2026-07-08
+- Confirmed no script/doc/secret still points at `heiyckeurcfjpnhmsjfo` (grep
+  clean across both repos, no GitHub secrets, no Vercel config).
+- Paused via Supabase MCP (`pause_project`) — reversible via
+  `restore_project` if anything surfaces.
+- **Still manual:** the MCP server has no `delete_project` tool. Matty
+  deletes it himself from the Supabase dashboard once comfortable —
+  skipped the original 2-week wait since Chunks 1-4 are already fully
+  verified against the new project (schema, data, deck picker all live).
 
 ---
 
